@@ -2,14 +2,10 @@
 ### Cyber Bootcamp Final Project (Progress Report)
 
 **Authors:**  
-[Your Name], [Partner Name]  
+Tamir Mareli, Ilay Romi  
 
 **Program:**  
 Cybersecurity Bootcamp  
-
-**Background:**  
-B.Sc. in Computer Science, The Hebrew University of Jerusalem  
-
 ---
 
 ## 1. Introduction
@@ -69,7 +65,7 @@ The test set contains attack types that do not appear in the training set, simul
 The raw dataset files were loaded into Pandas DataFrames.  
 Since the files do not include column headers, feature names were manually defined according to the official NSL-KDD documentation.
 
-To prepare the data for machine learning algorithms, we implemented a robust preprocessing pipeline:
+To prepare the data for machine learning algorithms, we implemented a structured preprocessing pipeline:
 1.  **Categorical Encoding:** Features such as `protocol_type`, `service`, and `flag` were transformed using **One-Hot Encoding**. Crucially, the encoder is configured to handle unknown categories in the test set to prevent runtime errors during inference.
 2.  **Feature Scaling:** Numerical features (e.g., `duration`, `src_bytes`) were standardized using `StandardScaler` to ensure that features with large ranges do not dominate the model's objective function.
 3.  **Target Mapping:** The 23 distinct attack labels were mapped into 5 major categories (Normal, DoS, Probe, R2L, U2R) to facilitate both binary and multi-class classification tasks.
@@ -98,7 +94,7 @@ The dataset was reformulated as a binary classification problem:
 - **Normal traffic**
 - **Attack traffic**
 
-Visualization of the class distribution revealed a **mild class imbalance**, with attack traffic slightly more prevalent than normal traffic.
+Visualization confirmed that the dataset is relatively balanced, with only a mild deviation between normal and attack traffic.
 
 Although the imbalance is not severe, it motivates the use of evaluation metrics beyond accuracy, such as **recall**, **precision**, and **F1-score**, particularly for the attack class.
 
@@ -114,13 +110,17 @@ Each specific attack label in the dataset was mapped to one of four high-level a
 
 Samples labeled as `normal` were assigned to the **Normal** category.
 
-### 6.1 Handling Unseen Attacks
+### 6.1 Handling Unseen Attacks in the Test Set
 
-The NSL-KDD test set includes attack types that do not appear in the training set.  
-Such samples were labeled as **Unknown** to avoid introducing artificial ground truth.
+The NSL-KDD test set includes attack types that do not appear in the training data,
+simulating real-world zero-day attack scenarios.
 
-In the **binary classification setting**, all non-normal samples (including Unknown) are treated as attacks.  
-For **multi-class evaluation**, samples labeled as Unknown may be excluded to ensure a fair evaluation.
+During preprocessing, such attack labels are explicitly mapped to an `Unknown` category.
+In the binary classification setting, all non-normal traffic—including unknown attacks—
+is treated as malicious.
+
+For the multi-class setting, the `Unknown` category is retained and encoded alongside
+the standard attack categories, enabling future analysis of unseen attack behavior.
 
 ---
 
@@ -128,22 +128,42 @@ For **multi-class evaluation**, samples labeled as Unknown may be excluded to en
 
 ### 7.1 Feature Selection
 
-Target variables were excluded from the feature set:
+Target-related variables were excluded from the feature set prior to preprocessing:
 - `label`
-- `attack_class`
-- `binary_target`
+- `attack_category`
+
+Binary and multi-class targets were stored separately and not included as model inputs.
 
 The remaining features were divided into:
 - **Categorical features:** `protocol_type`, `service`, `flag`
-- **Numerical features:** all remaining attributes
+- **Numerical features:** all remaining numeric attributes
+
+---
 
 ### 7.2 Encoding and Scaling
 
 A preprocessing pipeline was constructed using Scikit-learn:
-- **StandardScaler** was applied to numerical features.
-- **OneHotEncoder** was applied to categorical features, with `handle_unknown='ignore'` to safely process unseen categories in the test set.
+- Numerical features were standardized using `StandardScaler`.
+- Categorical features were encoded using `OneHotEncoder` with `handle_unknown='ignore'`
+  to safely process unseen categories in the test set.
 
-The preprocessing pipeline was fitted on the training data only and then applied to both training and test sets, preventing data leakage.
+To ensure compatibility across different Scikit-learn versions,
+the encoder initialization includes a fallback mechanism handling both legacy
+and newer parameter conventions.
+
+The preprocessing pipeline was fitted exclusively on the training data and then
+applied to both training and test sets, preventing data leakage.
+
+---
+
+### 7.3 Removal of Zero-Variance Features
+
+Numerical features with zero variance were identified and removed.
+Such features contain constant values across all samples and do not contribute
+any useful information for classification.
+
+The variance check was performed on the training set only, and the same features
+were removed from the test set to preserve feature alignment.
 
 ---
 
@@ -151,10 +171,12 @@ The preprocessing pipeline was fitted on the training data only and then applied
 
 After preprocessing:
 - Feature matrices were saved as NumPy arrays (`X_train.npy`, `X_test.npy`)
-- Target vectors were saved separately for binary and multi-class settings
+- Target vectors were saved for both binary and multi-class settings
+- Feature names were extracted for interpretability
 - The preprocessing pipeline was serialized for future inference
 
-At this stage, the dataset is fully prepared for machine learning model training.
+A validation step confirmed that class distributions between training and test
+sets remain consistent after preprocessing.
 
 ---
 
@@ -197,10 +219,13 @@ This structure enables clear separation between data handling, experimentation, 
 ## 10. Next Steps
 
 The next stages of the project include:
-- Training baseline supervised models (e.g., Logistic Regression, Random Forest)
-- Applying unsupervised anomaly detection techniques (e.g., Isolation Forest)
-- Evaluating models using appropriate metrics
-- Visualizing results and analyzing false positives and false negatives
+1. Baseline supervised models
+
+2. Unsupervised anomaly detection
+
+3. Evaluation & metrics
+
+4. Error analysis
 
 ---
 
