@@ -1,21 +1,18 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
 
 class FeatureExtractor:
     """
-    רכיב זה אחראי להמיר נתונים גולמיים (מסימולטור או מרשת חיה)
-    לפורמט שה-Pipeline של המודל יודע לקבל (Pandas DataFrame).
+    Converts a raw sample (from simulator or live capture) into a single-row
+    DataFrame matching the NSL-KDD raw feature schema expected by the preprocessor.
     """
 
-    def __init__(self, feature_names_path: str = None):
-        """
-        אתחול המחלץ.
-        :param feature_names_path: נתיב לקובץ feature_names.csv (אופציונלי לשימוש עתידי)
-        """
-        # רשימת הפיצ'רים שהמודל מצפה לקבל (בסדר המדויק)
-        # אלו העמודות הגולמיות לפני ה-OneHotEncoding (כי ה-preprocessor יעשה את הקידוד)
-        self.expected_columns = [
+    CATEGORICAL_COLS = ["protocol_type", "service", "flag"]
+
+    def __init__(self, expected_columns: Optional[List[str]] = None):
+        self.expected_columns = expected_columns or [
             'duration', 'protocol_type', 'service', 'flag', 'src_bytes', 'dst_bytes',
             'land', 'wrong_fragment', 'urgent', 'hot', 'num_failed_logins',
             'logged_in', 'num_compromised', 'root_shell', 'su_attempted', 'num_root',
@@ -30,38 +27,71 @@ class FeatureExtractor:
             'dst_host_srv_rerror_rate'
         ]
 
-    def process_sample(self, raw_sample: Dict[str, Any]) -> pd.DataFrame:
+        self.numeric_cols = [c for c in self.expected_columns if c not in self.CATEGORICAL_COLS]
+
+    def process_sample(self, raw_sample: Dict[str, Any], strict: bool = False) -> pd.DataFrame:
         """
-        מקבל מילון של נתונים (שורה אחת מה-CSV או פאקט מעובד)
-        ומחזיר DataFrame מוכן להכנסה ל-Preprocessor.
+        raw_sample: dict with raw feature values (may include extra keys).
+        strict: if True, raises if any expected column is missing in raw_sample.
         """
-        
-        # 1. יצירת DataFrame משורה בודדת
-        df_sample = pd.DataFrame([raw_sample])
-        
-        # 2. סינון עמודות מיותרות (כמו Label או Attack Type אם הם הגיעו מהטסט)
-        # אנחנו רוצים רק את הפיצ'רים שהמודל התאמן עליהם
-        features_only = df_sample.reindex(columns=self.expected_columns, fill_value=0)
-        
-        # 3. וידוא טיפוסי נתונים (חשוב מאוד!)
-        # Scikit-learn רגיש מאוד לטיפוסים. נבטיח שהמספרים הם אכן מספרים.
-        numeric_cols = [c for c in self.expected_columns if c not in ['protocol_type', 'service', 'flag']]
-        for col in numeric_cols:
-            features_only[col] = pd.to_numeric(features_only[col], errors='coerce').fillna(0)
-            
-        # 4. טיפול במחרוזות (Object types)
-        # מוודאים שהם String כדי שה-OneHotEncoder לא ייפול
-        categorical_cols = ['protocol_type', 'service', 'flag']
-        for col in categorical_cols:
-            features_only[col] = features_only[col].astype(str)
-            
-        return features_only
+        if not isinstance(raw_sample, dict):
+            raise TypeError("raw_sample must be a dict")
+
+        missing = [c for c in self.expected_columns if c not in raw_sample]
+        extra = [k for k in raw_sample.keys() if k not in self.expected_columns]
+
+        if strict and missing:
+            raise ValueError(f"Missing expected keys: {missing}")
+
+        if extra:
+            # Not an error; just useful debug info
+            # You can later route this to logger instead of print
+            print(f"[i] Ignoring extra keys: {extra[:10]}" + ("..." if len(extra) > 10 else ""))
+
+        df = pd.DataFrame([raw_sample])
+
+        # Keep only expected columns, fill missing
+        df = df.reindex(columns=self.expected_columns)
+
+        # Fill missing categoricals with 'unknown' (safer than "0")
+        for c in self.CATEGORICAL_COLS:
+            df[c] = df[c].fillna("unknown").astype(str)
+
+        # Convert numerics
+        for c in self.numeric_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # Fill NaNs in numerics with 0
+        df[self.numeric_cols] = df[self.numeric_cols].fillna(0)
+
+        # Normalize boolean-like columns to 0/1 if they exist
+        boolish = ["land", "logged_in", "root_shell", "is_host_login", "is_guest_login"]
+        for c in boolish:
+            if c in df.columns:
+                df[c] = df[c].apply(self._to_01)
+
+        # Optional: clamp known rate features to [0,1] to avoid weird upstream bugs
+        rate_cols = [c for c in df.columns if c.endswith("_rate")]
+        df[rate_cols] = df[rate_cols].clip(lower=0, upper=1)
+
+        return df
+
+    @staticmethod
+    def _to_01(x: Any) -> int:
+        if isinstance(x, (int, np.integer)):
+            return int(1 if x != 0 else 0)
+        if isinstance(x, (float, np.floating)):
+            return int(1 if x != 0.0 else 0)
+        s = str(x).strip().lower()
+        if s in {"1", "true", "yes", "y", "t"}:
+            return 1
+        if s in {"0", "false", "no", "n", "f", "", "none", "nan"}:
+            return 0
+        # fallback: treat unknown as 0
+        return 0
 
     def _calculate_derived_features(self, packet_history: List[Any]):
         """
-        פונקציה זו (Placeholder) תהיה בשימוש בעתיד כשנעבוד עם Scapy.
-        היא תפקידה לחשב פיצ'רים כמו 'count' (כמות חיבורים בשתי שניות אחרונות)
-        מתוך היסטוריית הפאקטים.
-        כרגע בסימולטור - הנתונים האלו כבר מגיעים מוכנים ב-CSV.
+        Placeholder for live Scapy features (count, srv_count, etc.)
         """
         pass
