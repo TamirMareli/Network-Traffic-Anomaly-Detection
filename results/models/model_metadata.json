@@ -42,15 +42,22 @@
     "urgent",
     "wrong_fragment"
   ],
-  "binary_threshold": 0.0010998000000000002,
+  "binary_threshold": 0.0010099800000000002,
   "threshold_strategy": {
-    "type": "MaxF2_with_PosRateBand",
+    "type": "MaxF2_PosRateBand",
     "beta": 2.0,
     "posrate_band": [
       0.55,
       0.75
-    ]
+    ],
+    "thr_floor": 1e-05
   },
   "binary_model_best_iteration": 3487,
-  "generated_at": "2025-12-23 20:19:39"
+  "classes_multi": [
+    "DoS",
+    "Probe",
+    "R2L",
+    "U2R"
+  ],
+  "generated_at": "2025-12-23 20:40:51"
 }
