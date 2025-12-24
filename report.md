@@ -1,240 +1,190 @@
 # Network Traffic Anomaly Detection with Machine Learning  
-### Cyber Bootcamp Final Project (Progress Report)
+## Cyber Bootcamp – Final Project Report
 
 **Authors:**  
 Tamir Mareli, Ilay Romi  
 
 **Program:**  
 Cybersecurity Bootcamp  
+
 ---
 
 ## 1. Introduction
 
-Modern computer networks generate vast amounts of traffic, making manual inspection impractical for detecting malicious behavior.  
-As a result, **Network Intrusion Detection Systems (NIDS)** increasingly rely on **machine learning techniques** to automatically identify anomalous traffic patterns that may indicate cyber attacks.
+Modern computer networks generate massive volumes of traffic, making manual inspection infeasible for detecting malicious activity. Consequently, **Network Intrusion Detection Systems (NIDS)** increasingly rely on **machine learning techniques** to automatically identify anomalous traffic patterns indicative of cyber attacks.
 
-The goal of this project is to design and implement a **network traffic anomaly detection pipeline** using machine learning, based on the **NSL-KDD dataset**, a well-known benchmark dataset for intrusion detection research.
+The objective of this project is to design, implement, and evaluate a **machine-learning-based network intrusion detection pipeline**, using the **NSL-KDD dataset** as a benchmark.
 
-This report documents the progress achieved so far, including dataset exploration, preprocessing, feature engineering, and preparation for model training.
+The project emphasizes:
+- Robust preprocessing with no data leakage
+- Recall-oriented detection suitable for real IDS deployment
+- Clear separation between data preparation, modeling, and evaluation
 
 ---
 
 ## 2. Problem Definition
 
-The task is formulated as a **network traffic anomaly detection problem**, where each network connection is classified as either:
+We formulate intrusion detection as a **supervised classification problem** under two settings:
 
-- **Normal traffic**
-- **Malicious traffic (Attack)**
+1. **Binary classification**
+   - Normal
+   - Attack
 
-Two classification settings are considered:
-1. **Binary classification**: Normal vs Attack  
-2. **Multi-class classification**: Normal, DoS, Probe, R2L, U2R  
+2. **Multi-class classification (Attack-only)**
+   - DoS
+   - Probe
+   - R2L
+   - U2R
 
-At the current stage of the project, the focus is placed on the **binary anomaly detection formulation**, which aligns well with real-world intrusion detection systems and is more robust given the limited project timeline.
-
----
-
-## 3. Dataset Description – NSL-KDD
-
-The project uses the **NSL-KDD dataset**, an improved version of the original KDD Cup 1999 dataset, designed to address redundancy and bias issues present in the original benchmark. 
-
-**Key Findings:**
-* **Class Balance:** The dataset is relatively balanced (approx. 53% Normal vs. 47% Attack), reducing the immediate need for synthetic oversampling (SMOTE).
-* **Correlation Analysis:** A correlation matrix was computed to identify features most strongly associated with malicious activity. 
-    * We observed that traffic features related to **synchronization errors** (e.g., `dst_host_srv_serror_rate`, `serror_rate`) show a very strong positive correlation (>0.65) with attacks. This suggests that many attacks in the dataset (likely DoS or Probe) involve manipulating the TCP handshake process.
-    * Conversely, features like `same_srv_rate` showed negative correlation, indicating they are more typical of normal traffic.
-
-
-### 3.1 Dataset Structure
-
-Each sample in the dataset represents a network connection described by **41 features**, including:
-- Basic features (e.g., protocol type, duration)
-- Content-based features
-- Traffic-based statistical features
-
-The dataset includes:
-- **Training set:** `KDDTrain+`
-- **Test set:** `KDDTest+`
-
-The test set contains attack types that do not appear in the training set, simulating real-world scenarios where previously unseen attacks may occur.
+The primary focus is on the **binary detection task**, reflecting real-world IDS requirements where **missing an attack is significantly more costly than raising a false alarm**.
 
 ---
 
-## 4. Data Loading and Cleaning
+## 3. Dataset – NSL-KDD
 
-The raw dataset files were loaded into Pandas DataFrames.  
-Since the files do not include column headers, feature names were manually defined according to the official NSL-KDD documentation.
+The project uses the **NSL-KDD dataset**, an improved version of the KDD Cup 1999 dataset designed to reduce redundancy and evaluation bias.
 
-To prepare the data for machine learning algorithms, we implemented a structured preprocessing pipeline:
-1.  **Categorical Encoding:** Features such as `protocol_type`, `service`, and `flag` were transformed using **One-Hot Encoding**. Crucially, the encoder is configured to handle unknown categories in the test set to prevent runtime errors during inference.
-2.  **Feature Scaling:** Numerical features (e.g., `duration`, `src_bytes`) were standardized using `StandardScaler` to ensure that features with large ranges do not dominate the model's objective function.
-3.  **Target Mapping:** The 23 distinct attack labels were mapped into 5 major categories (Normal, DoS, Probe, R2L, U2R) to facilitate both binary and multi-class classification tasks.
+### Key Characteristics
+- 41 traffic features per connection
+- Mix of numerical and categorical attributes
+- Test set contains previously unseen attack types, simulating zero-day scenarios
 
-### 4.1 Missing Values
+### Class Distribution
+- Training set: ~53% Normal, ~47% Attack  
+- Test set: skewed toward attacks (~57%)
 
-A thorough inspection revealed:
-- No missing (null) values in either the training or test datasets.
-
-### 4.2 Duplicate Samples
-
-Duplicate samples were detected in both datasets.  
-To reduce redundancy and potential overfitting, duplicate rows were removed during preprocessing.
-
-### 4.3 Removal of Metadata Attributes
-
-The `difficulty` attribute was removed from the dataset, as it represents meta-information about the complexity of each sample rather than a meaningful feature for model training.
+This distribution shift motivates recall-oriented evaluation.
 
 ---
 
-## 5. Exploratory Data Analysis (EDA)
+## 4. Data Exploration (Notebook 01)
 
-### 5.1 Class Distribution
+Exploratory data analysis was conducted to understand:
+- Feature distributions
+- Class balance
+- Correlations between features and attack labels
 
-The dataset was reformulated as a binary classification problem:
-- **Normal traffic**
-- **Attack traffic**
+Key observations:
+- TCP error-related features (e.g., `serror_rate`, `dst_host_serror_rate`) strongly correlate with attack traffic
+- Rate-based features are especially indicative of DoS and Probe attacks
 
-Visualization confirmed that the dataset is relatively balanced, with only a mild deviation between normal and attack traffic.
-
-Although the imbalance is not severe, it motivates the use of evaluation metrics beyond accuracy, such as **recall**, **precision**, and **F1-score**, particularly for the attack class.
-
----
-
-## 6. Attack Categorization
-
-Each specific attack label in the dataset was mapped to one of four high-level attack categories:
-- **DoS (Denial of Service)**
-- **Probe**
-- **R2L (Remote to Local)**
-- **U2R (User to Root)**
-
-Samples labeled as `normal` were assigned to the **Normal** category.
-
-### 6.1 Handling Unseen Attacks in the Test Set
-
-The NSL-KDD test set includes attack types that do not appear in the training data,
-simulating real-world zero-day attack scenarios.
-
-During preprocessing, such attack labels are explicitly mapped to an `Unknown` category.
-In the binary classification setting, all non-normal traffic—including unknown attacks—
-is treated as malicious.
-
-For the multi-class setting, the `Unknown` category is retained and encoded alongside
-the standard attack categories, enabling future analysis of unseen attack behavior.
+**Note:**  
+Notebook 01 is **exploratory only** and does not produce artifacts consumed by later stages.
 
 ---
 
-## 7. Feature Engineering and Preprocessing
+## 5. Data Preprocessing (Notebook 02)
 
-### 7.1 Feature Selection
+All preprocessing that produces reusable artifacts is centralized in **Notebook 02**.
 
-Target-related variables were excluded from the feature set prior to preprocessing:
-- `label`
-- `attack_category`
+### Steps Performed
+1. Load raw NSL-KDD files (`KDDTrain+`, `KDDTest+`)
+2. Assign feature names according to the official dataset specification
+3. Remove metadata attributes (e.g., difficulty level)
+4. Map fine-grained attack labels to:
+   - `attack_class` (Normal, DoS, Probe, R2L, U2R)
+   - `binary_target` (Normal vs Attack)
+5. Lock a unified feature schema (41 features)
+6. Save cleaned datasets:
+   - `data/processed/train_cleaned.csv`
+   - `data/processed/test_cleaned.csv`
 
-Binary and multi-class targets were stored separately and not included as model inputs.
-
-The remaining features were divided into:
-- **Categorical features:** `protocol_type`, `service`, `flag`
-- **Numerical features:** all remaining numeric attributes
-
----
-
-### 7.2 Encoding and Scaling
-
-A preprocessing pipeline was constructed using Scikit-learn:
-- Numerical features were standardized using `StandardScaler`.
-- Categorical features were encoded using `OneHotEncoder` with `handle_unknown='ignore'`
-  to safely process unseen categories in the test set.
-
-To ensure compatibility across different Scikit-learn versions,
-the encoder initialization includes a fallback mechanism handling both legacy
-and newer parameter conventions.
-
-The preprocessing pipeline was fitted exclusively on the training data and then
-applied to both training and test sets, preventing data leakage.
+No scaling, encoding, or model-dependent transformations are applied at this stage to prevent data leakage.
 
 ---
 
-### 7.3 Removal of Zero-Variance Features
+## 6. Feature Engineering & Modeling Pipeline (Notebook 03)
 
-Numerical features with zero variance were identified and removed.
-Such features contain constant values across all samples and do not contribute
-any useful information for classification.
+### 6.1 Preprocessing Pipeline
 
-The variance check was performed on the training set only, and the same features
-were removed from the test set to preserve feature alignment.
+All model-dependent preprocessing is implemented using a **Scikit-learn Pipeline**:
 
----
+- **Numerical features**
+  - Safe `log1p` transformation for heavy-tailed attributes
+  - RobustScaler to reduce sensitivity to outliers
+- **Categorical features**
+  - OneHotEncoder with `handle_unknown="ignore"`
 
-## 8. Prepared Data for Modeling
-
-After preprocessing:
-- Feature matrices were saved as NumPy arrays (`X_train.npy`, `X_test.npy`)
-- Target vectors were saved for both binary and multi-class settings
-- Feature names were extracted for interpretability
-- The preprocessing pipeline was serialized for future inference
-
-A validation step confirmed that class distributions between training and test
-sets remain consistent after preprocessing.
+The pipeline is fitted **only on training data**.
 
 ---
 
-## 9. Project Structure
+### 6.2 Binary Classification Model
 
-The project follows a modular and reproducible structure:
+Binary intrusion detection is performed using **XGBoost**, configured to maximize generalization under distribution shift.
 
+Key design choices:
+- Shallow trees (`max_depth=3`)
+- Strong regularization (`min_child_weight`, `reg_lambda`)
+- Recall-biased class weighting
+- Early stopping on a dedicated validation set
+
+---
+
+### 6.3 Threshold Selection Strategy
+
+Instead of using the default decision threshold (0.5), the threshold is tuned on a **dedicated threshold set (15%)**.
+
+#### Strategy
+- Optimize **F2-score** (recall-weighted)
+- Constrain predictions to a realistic **positive rate band**
+- Avoid probability calibration due to probability collapse and dataset shift
+
+The resulting threshold is intentionally low, reflecting highly polarized probability outputs while achieving strong recall.
+
+---
+
+## 7. Binary Classification Results (Test Set)
+
+| Metric | Value |
+|------|------|
+| Accuracy | ~0.895 |
+| Attack Recall | **~0.94** |
+| Attack Precision | ~0.88 |
+| ROC-AUC | ~0.95 |
+| PR-AUC | ~0.95 |
+
+These results demonstrate a recall-oriented detector suitable for deployment in intrusion detection systems.
+
+---
+
+## 8. Multi-class Attack Classification
+
+A separate XGBoost model is trained **only on attack samples** to classify attack types.
+
+Performance varies by class:
+- DoS and R2L achieve strong precision
+- Probe and U2R remain challenging due to limited training samples
+
+This behavior aligns with known limitations of the NSL-KDD dataset.
+
+---
+
+## 9. Online Feature Compatibility
+
+The `FeatureExtractor` module provides a bridge between:
+- Offline NSL-KDD training
+- Online or simulated network traffic ingestion
+
+It ensures strict schema alignment and safe handling of missing or unknown feature values.
+
+---
+
+## 10. Project Structure
+
+```text
 NETWORK-TRAFFIC-ANOMALY-DETECTION/
-│
 ├── data/
 │   ├── raw/
 │   └── processed/
 │       ├── train_cleaned.csv
 │       └── test_cleaned.csv
-│
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb
 │   ├── 02_preprocessing.ipynb
-│   ├── 03_model_training.ipynb
-│   └── 04_evaluation.ipynb
-│
-├── results/
-│   ├── figures/
-│   └── metrics/
-│
+│   └── 03_model_training.ipynb
 ├── src/
-│   ├── preprocessing.py
-│   ├── models.py
-│   └── evaluation.py
-│
-├── README.md
+│   └── feature_extraction.py
+├── results/
 ├── report.md
 └── requirements.txt
-
-
-This structure enables clear separation between data handling, experimentation, modeling, and evaluation.
-
----
-
-## 10. Next Steps
-
-The next stages of the project include:
-1. Baseline supervised models
-
-2. Unsupervised anomaly detection
-
-3. Evaluation & metrics
-
-4. Error analysis
-
----
-
-## 11. Conclusion
-
-This report documents the initial stages of a machine-learning-based network traffic anomaly detection system.  
-Through careful dataset exploration, preprocessing, and feature engineering, a solid foundation has been established for subsequent modeling and evaluation.
-
-The methodology emphasizes reproducibility, fairness in evaluation, and alignment with real-world intrusion detection challenges.
-
-
-
