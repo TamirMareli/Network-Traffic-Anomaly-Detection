@@ -8,6 +8,7 @@ class FeatureExtractor:
     Converts a raw sample (from simulator or live capture) into a single-row
     DataFrame matching the NSL-KDD raw feature schema expected by the preprocessor.
     """
+    
 
     CATEGORICAL_COLS = ["protocol_type", "service", "flag"]
 
