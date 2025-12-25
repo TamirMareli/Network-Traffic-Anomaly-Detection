@@ -10,6 +10,7 @@ import time
 from collections import deque
 from scapy.all import sniff, IP, TCP, UDP, ICMP
 import datetime
+import requests  # Added for Telegram integration
 
 # ==========================================
 # 1. PAGE CONFIGURATION & STYLING
@@ -34,14 +35,39 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. HELPER FUNCTIONS (תיקון קריטי: הפונקציה החסרה)
+# 2. TELEGRAM CONFIGURATION
 # ==========================================
-# הפונקציה הזו חייבת להיות מוגדרת לפני טעינת המודל
+# Credentials from your previous code
+TELEGRAM_TOKEN = "8225807627:AAE6HavZtBvq0JJ1QJBYeiMUYOXCUTKUbac"
+TELEGRAM_CHAT_ID = "1340013944"
+
+def send_telegram_alert(risk_score, protocol, src_ip):
+    """
+    Sends an alert to Telegram when an attack is detected.
+    """
+    msg = (f"🚨 *SECURITY ALERT!* \n\n"
+           f"⚠️ **Threat Detected!**\n"
+           f"📊 **Attack Probability:** {risk_score:.1%}\n"
+           f"🔌 **Protocol:** {protocol}\n"
+           f"📍 **Source IP:** {src_ip}\n"
+           f"🛡️ **Action:** Logging event & Monitoring.")
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        # Send the request to Telegram API
+        requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+
+# ==========================================
+# 3. HELPER FUNCTIONS
+# ==========================================
+# This function must be defined before loading the model
 def safe_log1p(x):
     return np.log1p(np.abs(x))
 
 # ==========================================
-# 3. LOAD SYSTEM RESOURCES
+# 4. LOAD SYSTEM RESOURCES
 # ==========================================
 def get_project_root():
     """
@@ -74,7 +100,7 @@ def load_system():
     """
     sys = {}
     try:
-        # מוודאים שהפונקציה זמינה בזיכרון הגלובלי כדי ש-joblib ימצא אותה
+        # Ensure the function is available in global memory for joblib
         global safe_log1p
         
         sys["bin"] = joblib.load(FILES["binary"])
@@ -93,9 +119,12 @@ if 'history' not in st.session_state:
     st.session_state.history = deque(maxlen=60) # Keep last 60 packets
 if 'packet_times' not in st.session_state:
     st.session_state.packet_times = deque(maxlen=2000) # Used for traffic intensity
+# State to manage Telegram spam (Rate Limiting)
+if 'last_telegram_alert' not in st.session_state:
+    st.session_state.last_telegram_alert = 0
 
 # ==========================================
-# 4. PACKET PROCESSING ENGINE
+# 5. PACKET PROCESSING ENGINE
 # ==========================================
 def process_packet(pkt):
     """
@@ -143,7 +172,7 @@ def process_packet(pkt):
         return None
 
 # ==========================================
-# 5. MAIN DASHBOARD UI
+# 6. MAIN DASHBOARD UI
 # ==========================================
 def main():
     # --- Sidebar Controls ---
@@ -165,6 +194,10 @@ def main():
         # Noise Filter
         smart_filter = st.checkbox("Smart Filter (Reduce Noise)", value=True, 
                                    help="Ignores standard UDP/DNS traffic unless risk is very high.")
+        
+        # Telegram Toggle
+        enable_telegram = st.checkbox("Enable Telegram Alerts", value=True,
+                                      help="Send notifications to Admin when attack is detected.")
         
         st.info("Tip: If you see too many False Positives, check 'Invert Model Logic' first.")
 
@@ -245,7 +278,15 @@ def main():
                 if prob_attack > threshold:
                     is_alert = True
 
-            # 6. Update History State
+            # 6. Telegram Notification Logic (New Feature)
+            if is_alert and enable_telegram:
+                current_time = time.time()
+                # Check if 10 seconds have passed since last alert to avoid spam
+                if current_time - st.session_state.last_telegram_alert > 10:
+                    send_telegram_alert(prob_attack, feat['protocol_type'], src_ip)
+                    st.session_state.last_telegram_alert = current_time
+
+            # 7. Update History State
             now_str = datetime.datetime.now().strftime("%H:%M:%S")
             st.session_state.history.append({
                 "Time": now_str, 
