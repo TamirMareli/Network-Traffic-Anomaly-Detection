@@ -7,75 +7,53 @@ import plotly.express as px
 from pathlib import Path
 import numpy as np
 import time
-from collections import deque, Counter
+from collections import deque
 from scapy.all import sniff, IP, TCP, UDP, ICMP
 import datetime
 
 # ==========================================
-# 1. CORE CONFIG & STYLING
+# 1. PAGE CONFIGURATION & STYLING
 # ==========================================
 st.set_page_config(
-    page_title="CyberSentinel PRO",
+    page_title="Sentinel AI | Advanced IDS",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for Professional Dark Mode
+# Custom CSS for Dark Theme
 st.markdown("""
 <style>
-    /* Global Theme */
-    .stApp { background-color: #0f1116; color: #e6e6e6; }
-    
-    /* Metrics Styling */
-    div[data-testid="metric-container"] {
-        background-color: #1e2130;
-        border-left: 4px solid #4a90e2;
-        padding: 10px 15px;
-        border-radius: 6px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    
-    /* Buttons */
-    .stButton button { width: 100%; border-radius: 5px; font-weight: bold; }
-    
-    /* Status Indicators */
-    .status-ok { color: #00ff41; font-weight: 800; }
-    .status-danger { color: #ff0055; font-weight: 800; animation: blink 1s infinite; }
-    
-    @keyframes blink { 50% { opacity: 0.5; } }
+    .stApp { background-color: #0E1117; color: #FAFAFA; }
+    .stMetric { background-color: #262730; padding: 10px; border-radius: 5px; border-left: 5px solid #4CAF50; }
+    /* Headers */
+    h1, h2, h3 { font-family: 'Segoe UI', sans-serif; font-weight: 600; }
+    /* Dataframes */
+    div[data-testid="stDataFrame"] { border: 1px solid #333; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. LOGIC HELPERS
+# 2. HELPER FUNCTIONS (תיקון קריטי: הפונקציה החסרה)
 # ==========================================
-def safe_log1p(x): return np.log1p(np.abs(x))
+# הפונקציה הזו חייבת להיות מוגדרת לפני טעינת המודל
+def safe_log1p(x):
+    return np.log1p(np.abs(x))
 
+# ==========================================
+# 3. LOAD SYSTEM RESOURCES
+# ==========================================
 def get_project_root():
+    """
+    Finds the project root directory to locate models and data.
+    """
     current_path = Path(__file__).resolve().parent
     for _ in range(4):
         if (current_path / "results").exists(): return current_path
         current_path = current_path.parent
         if current_path == current_path.parent: break
-    raise FileNotFoundError("Root not found")
+    return current_path # Fallback
 
-# --- Initialize Session State ---
-if 'monitoring' not in st.session_state: st.session_state.monitoring = False
-if 'packet_count' not in st.session_state: st.session_state.packet_count = 0
-if 'threat_count' not in st.session_state: st.session_state.threat_count = 0
-if 'history_time' not in st.session_state: st.session_state.history_time = deque(maxlen=50)
-if 'history_risk' not in st.session_state: st.session_state.history_risk = deque(maxlen=50)
-if 'proto_counts' not in st.session_state: st.session_state.proto_counts = Counter()
-if 'log_data' not in st.session_state: st.session_state.log_data = deque(maxlen=20)
-if 'threat_log' not in st.session_state: st.session_state.threat_log = deque(maxlen=50) # Only attacks
-
-# Packet time tracker for 'count' feature
-if 'packet_times' not in st.session_state: st.session_state.packet_times = deque(maxlen=2000)
-
-# ==========================================
-# 3. LOAD MODELS
-# ==========================================
 try:
     ROOT = get_project_root()
     FILES = {
@@ -86,220 +64,234 @@ try:
         "schema": ROOT / "data/processed/realtime_schema.json"
     }
 except:
-    st.error("❌ Critical: File paths not found.")
+    st.error("Error: Could not locate project files. Please check directory structure.")
     st.stop()
 
 @st.cache_resource
-def load_resources():
+def load_system():
+    """
+    Loads trained models and schema metadata.
+    """
     sys = {}
-    sys["bin"] = joblib.load(FILES["binary"])
-    sys["mul"] = joblib.load(FILES["multi"])
-    sys["enc"] = joblib.load(FILES["enc"])
-    with open(FILES["meta"]) as f: sys["meta"] = json.load(f)
-    with open(FILES["schema"]) as f: sys["schema"] = json.load(f)
+    try:
+        # מוודאים שהפונקציה זמינה בזיכרון הגלובלי כדי ש-joblib ימצא אותה
+        global safe_log1p
+        
+        sys["bin"] = joblib.load(FILES["binary"])
+        sys["mul"] = joblib.load(FILES["multi"])
+        sys["enc"] = joblib.load(FILES["enc"])
+        with open(FILES["schema"]) as f: sys["schema"] = json.load(f)
+    except Exception as e:
+        st.error(f"Failed to load models: {e}")
+        st.error("Tip: This usually happens if 'safe_log1p' is missing.")
     return sys
 
-system = load_resources()
+system = load_system()
+
+# Initialize Session State
+if 'history' not in st.session_state:
+    st.session_state.history = deque(maxlen=60) # Keep last 60 packets
+if 'packet_times' not in st.session_state:
+    st.session_state.packet_times = deque(maxlen=2000) # Used for traffic intensity
 
 # ==========================================
-# 4. PACKET PROCESSING
+# 4. PACKET PROCESSING ENGINE
 # ==========================================
 def process_packet(pkt):
-    feat = {}
-    if TCP in pkt:
-        feat['protocol_type'] = 'tcp'
-        feat['service'] = 'http' if pkt[TCP].dport == 80 or pkt[TCP].sport == 80 else 'private'
-        feat['flag'] = 'SF'
-    elif UDP in pkt:
-        feat['protocol_type'] = 'udp'
-        feat['service'] = 'domain_u'
-        feat['flag'] = 'SF'
-    elif ICMP in pkt:
-        feat['protocol_type'] = 'icmp'
-        feat['service'] = 'ecr_i'
-        feat['flag'] = 'SF'
-    else: return None
+    """
+    Extracts features from raw Scapy packets to match model input.
+    """
+    try:
+        if IP not in pkt: return None
+        
+        feat = {}
+        # Basic Protocol Extraction
+        if TCP in pkt:
+            feat['protocol_type'] = 'tcp'
+            feat['service'] = 'http' if pkt[TCP].dport in [80, 443, 8080] else 'private'
+            feat['flag'] = 'SF'
+        elif UDP in pkt:
+            feat['protocol_type'] = 'udp'
+            feat['service'] = 'domain_u' # Common for DNS/Streaming
+            feat['flag'] = 'SF'
+        elif ICMP in pkt:
+            feat['protocol_type'] = 'icmp'
+            feat['service'] = 'ecr_i'
+            feat['flag'] = 'SF'
+        else:
+            return None
 
-    feat['src_bytes'] = len(pkt)
-    feat['dst_bytes'] = 0
-    
-    # Calc Count (pkts in last 2 secs)
-    now = time.time()
-    st.session_state.packet_times.append(now)
-    recent = [t for t in st.session_state.packet_times if now - t <= 2]
-    feat['count'] = len(recent)
-    
-    # Defaults
-    feat['srv_count'] = feat['count']
-    feat['same_srv_rate'] = 1.0
-    feat['diff_srv_rate'] = 0.0
-    
-    return feat
+        feat['src_bytes'] = len(pkt)
+        feat['dst_bytes'] = 0
+        
+        # Calculate Traffic Intensity ('count' feature)
+        now = time.time()
+        st.session_state.packet_times.append(now)
+        # How many packets arrived in the last 2 seconds?
+        recent_count = len([t for t in st.session_state.packet_times if now - t <= 2.0])
+        feat['count'] = recent_count
+        
+        # Default values for complex features not calculable in simple sniffing
+        feat['srv_count'] = recent_count 
+        feat['same_srv_rate'] = 1.0
+        feat['diff_srv_rate'] = 0.0
+        feat['dst_host_count'] = 1
+        feat['dst_host_srv_count'] = 1
+        
+        return feat, pkt[IP].src, pkt[IP].dst
+    except:
+        return None
 
 # ==========================================
-# 5. UI LAYOUT & MAIN LOOP
+# 5. MAIN DASHBOARD UI
 # ==========================================
 def main():
-    # --- Sidebar ---
+    # --- Sidebar Controls ---
     with st.sidebar:
-        st.title("🎛️ Control Center")
-        
-        # Start/Pause Button with dynamic label
-        if st.session_state.monitoring:
-            if st.button("⏸️ PAUSE MONITORING", type="primary"):
-                st.session_state.monitoring = False
-                st.rerun()
-        else:
-            if st.button("▶️ START MONITORING", type="primary"):
-                st.session_state.monitoring = True
-                st.rerun()
+        st.header("🎛️ Control Panel")
+        run_sniffer = st.toggle("Start Monitoring (Live Sniffer)", value=False)
         
         st.divider()
-        st.write("🔧 **Settings**")
-        thresh = st.slider("Alert Threshold", 0.0, 1.0, system['meta'].get('binary_threshold', 0.5))
+        st.subheader("Model Calibration")
         
-        if st.button("🗑️ Reset Statistics"):
-            st.session_state.packet_count = 0
-            st.session_state.threat_count = 0
-            st.session_state.history_time.clear()
-            st.session_state.history_risk.clear()
-            st.session_state.proto_counts.clear()
-            st.session_state.log_data.clear()
-            st.session_state.threat_log.clear()
-            st.rerun()
+        # Sensitivity Slider
+        threshold = st.slider("Alert Threshold", 0.0, 1.0, 0.75, 
+                              help="Higher value = Fewer alerts. Lower value = More sensitive.")
+        
+        # Logic Inversion
+        invert_logic = st.checkbox("Invert Model Logic", value=False, 
+                                   help="Check this if the system flags safe traffic as attacks.")
+        
+        # Noise Filter
+        smart_filter = st.checkbox("Smart Filter (Reduce Noise)", value=True, 
+                                   help="Ignores standard UDP/DNS traffic unless risk is very high.")
+        
+        st.info("Tip: If you see too many False Positives, check 'Invert Model Logic' first.")
 
-    # --- Main Screen ---
-    st.title("🛡️ Network Security Operations (SOC)")
+    st.title("🛡️ Network Traffic Inspector")
     
-    # Top KPI Row
-    k1, k2, k3, k4 = st.columns(4)
-    status_ph = k1.empty()
-    count_ph = k2.empty()
-    threat_ph = k3.empty()
-    proto_ph = k4.empty()
-
-    # Middle Charts Row
-    c1, c2, c3 = st.columns([1, 2, 1])
-    gauge_ph = c1.empty()
-    chart_ph = c2.empty()
-    pie_ph = c3.empty()
-
-    # Tabs for Logs
+    # --- Layout Metrics ---
+    # Top Metrics Row
+    c1, c2, c3, c4 = st.columns(4)
+    kpi_status = c1.empty()
+    kpi_risk = c2.empty()
+    kpi_proto = c3.empty()
+    kpi_vol = c4.empty()
+    
     st.divider()
-    tab_all, tab_threats = st.tabs(["📜 Live Traffic Log", "🚨 Threat History"])
-    log_all_ph = tab_all.empty()
-    log_threat_ph = tab_threats.empty()
-
-    # --- THE MONITORING LOOP ---
     
-    # If paused, just show current static data
-    if not st.session_state.monitoring:
-        status_ph.metric("System Status", "PAUSED", delta_color="off")
-        # Draw charts once so they don't disappear
-        if st.session_state.log_data:
-            df_hist = pd.DataFrame({'Time': list(st.session_state.history_time), 'Risk': list(st.session_state.history_risk)})
-            chart_ph.plotly_chart(px.area(df_hist, x='Time', y='Risk', title="Risk Timeline"), use_container_width=True)
-            log_all_ph.dataframe(pd.DataFrame(st.session_state.log_data), use_container_width=True, hide_index=True)
-        return # Exit main(), waiting for user to click Start
+    # Main Analysis Area
+    col_main, col_details = st.columns([2, 1])
+    
+    with col_main:
+        st.subheader("📊 Real-Time Risk Analysis")
+        chart_ph = st.empty()
+        
+    with col_details:
+        st.subheader("🔍 Last Packet Details")
+        details_ph = st.empty()
 
-    # While Running
-    while st.session_state.monitoring:
-        try:
-            # 1. Sniff
+    # Log Table
+    st.subheader("📜 Traffic Log")
+    log_ph = st.empty()
+
+    # --- Sniffer Loop ---
+    if run_sniffer:
+        while True:
+            # 1. Capture Packet
             packets = sniff(count=1, timeout=0.1)
-            
-            # Logic: If no packet, just skip loop iteration but don't crash
             if not packets:
-                time.sleep(0.05)
+                time.sleep(0.01)
                 continue
+            
+            # 2. Process Packet
+            data = process_packet(packets[0])
+            if not data: continue
+            feat, src_ip, dst_ip = data
+            
+            # 3. Prepare Data for Model
+            # Create a DataFrame with all columns initialized to 0.0
+            input_df = pd.DataFrame(0.0, index=[0], columns=system["schema"]["raw_feature_columns"])
+            # Update only extracted features
+            for k, v in feat.items():
+                if k in input_df.columns:
+                    input_df[k] = v
+            
+            # 4. Prediction
+            try:
+                raw_prob = system["bin"].predict_proba(input_df)[0]
                 
-            pkt = packets[0]
-            if IP not in pkt: continue
+                # Handle Inverted Logic
+                # Usually index [1] is 'Attack'. If model is inverted, index [0] is 'Attack'.
+                if invert_logic:
+                    prob_attack = raw_prob[0] 
+                else:
+                    prob_attack = raw_prob[1]
+            except Exception as e:
+                # Fallback if prediction fails
+                prob_attack = 0.0
+                
+            # 5. Smart Filtering Logic
+            is_alert = False
             
-            # 2. Process
-            feat = process_packet(pkt)
-            if not feat: continue
-            
-            # 3. Predict
-            df_in = pd.DataFrame([{col: feat.get(col, 0.0) for col in system["schema"]["raw_feature_columns"]}])
-            df_in = df_in[system["schema"]["raw_feature_columns"]] # Ensure order
-            
-            prob = system["bin"].predict_proba(df_in)[0][1]
-            if feat['protocol_type'] == 'udp':
-                is_attack = prob > 0.8
+            if smart_filter:
+                # If protocol is UDP (often noise) and probability isn't extreme -> Ignore
+                if feat['protocol_type'] == 'udp' and prob_attack < 0.95:
+                    is_alert = False
+                    prob_attack = 0.1 # Artificially lower visual risk
+                elif prob_attack > threshold:
+                    is_alert = True
             else:
-                is_attack = prob > thresh
-                        
-            # 4. Update Stats
-            st.session_state.packet_count += 1
-            st.session_state.proto_counts[feat['protocol_type']] += 1
-            now_str = datetime.datetime.now().strftime('%H:%M:%S')
-            
-            st.session_state.history_time.append(now_str)
-            st.session_state.history_risk.append(prob)
-            
-            if is_attack:
-                st.session_state.threat_count += 1
-                att_idx = system["mul"].predict(df_in)[0]
-                att_name = system["enc"].inverse_transform([att_idx])[0]
-                
-                # Add to Threat Log
-                st.session_state.threat_log.appendleft({
-                    "Time": now_str, "Type": att_name.upper(), 
-                    "Src": pkt[IP].src, "Confidence": f"{prob:.1%}"
-                })
-            
-            # Add to General Log
-            st.session_state.log_data.appendleft({
-                "Time": now_str, "Proto": feat['protocol_type'], 
-                "Src": pkt[IP].src, "Bytes": feat['src_bytes'], 
-                "Risk": f"{prob:.2f}", "Status": "🛑 ATTACK" if is_attack else "OK"
+                if prob_attack > threshold:
+                    is_alert = True
+
+            # 6. Update History State
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            st.session_state.history.append({
+                "Time": now_str, 
+                "Risk": prob_attack, 
+                "Bytes": feat['src_bytes'],
+                "IsAttack": 1 if is_alert else 0
             })
             
-            # 5. RENDER UI (Fast Updates)
+            # --- Render UI Updates ---
             
             # KPIs
-            status_ph.metric("Status", "ACTIVE MONITORING", delta="Scanning...")
-            count_ph.metric("Packets Scanned", st.session_state.packet_count)
-            threat_ph.metric("Threats Detected", st.session_state.threat_count, delta_color="inverse")
-            proto_ph.metric("Current Proto", feat['protocol_type'].upper())
-            
-            # Gauge
-            gauge_fig = go.Figure(go.Indicator(
-                mode="gauge+number", value=prob*100, 
-                title={'text': "Risk Level"},
-                gauge={'axis': {'range': [None, 100]}, 
-                       'bar': {'color': "#ff0055" if is_attack else "#00ff41"},
-                       'threshold': {'line': {'color': "white", 'width': 2}, 'value': thresh*100}}
-            ))
-            gauge_fig.update_layout(height=250, margin=dict(l=20,r=20,t=50,b=20), paper_bgcolor="rgba(0,0,0,0)", font={'color': "white"})
-            gauge_ph.plotly_chart(gauge_fig, use_container_width=True)
-            
-            # Timeline Chart
-            chart_df = pd.DataFrame({'Time': list(st.session_state.history_time), 'Risk': list(st.session_state.history_risk)})
-            line_fig = px.area(chart_df, x='Time', y='Risk', template="plotly_dark", title="Real-Time Risk Analysis")
-            line_fig.update_layout(height=250, margin=dict(l=20,r=20,t=40,b=20), yaxis_range=[0, 1.1])
-            chart_ph.plotly_chart(line_fig, use_container_width=True)
-            
-            # Pie Chart
-            pie_df = pd.DataFrame.from_dict(st.session_state.proto_counts, orient='index', columns=['count']).reset_index()
-            pie_fig = px.pie(pie_df, values='count', names='index', template="plotly_dark", title="Protocol Distribution", hole=0.4)
-            pie_fig.update_layout(height=250, margin=dict(l=20,r=20,t=40,b=20), showlegend=False)
-            pie_ph.plotly_chart(pie_fig, use_container_width=True)
-            
-            # Logs
-            log_all_ph.dataframe(pd.DataFrame(st.session_state.log_data), use_container_width=True, hide_index=True)
-            if st.session_state.threat_log:
-                log_threat_ph.dataframe(pd.DataFrame(st.session_state.threat_log), use_container_width=True, hide_index=True)
+            if is_alert:
+                kpi_status.metric("Status", "⚠️ ATTACK DETECTED", delta_color="inverse")
             else:
-                log_threat_ph.info("No threats detected yet.")
-                
-            time.sleep(0.01) # Yield a tiny bit of CPU
-
-        except Exception as e:
-            # Silent fail for UI stability, print to console if needed
-            print(e)
-            time.sleep(1)
+                kpi_status.metric("Status", "✅ SYSTEM SECURE", delta_color="normal")
+            
+            kpi_risk.metric("Attack Probability", f"{prob_attack:.1%}", delta=None)
+            kpi_proto.metric("Protocol", feat['protocol_type'].upper())
+            kpi_vol.metric("Packet Size", f"{feat['src_bytes']} bytes")
+            
+            # Chart
+            df_hist = pd.DataFrame(st.session_state.history)
+            fig = px.area(df_hist, x="Time", y="Risk", title="Risk Level Over Time", 
+                          color_discrete_sequence=["#FF4B4B" if is_alert else "#00CC96"])
+            fig.update_layout(yaxis_range=[0, 1.1], height=300, 
+                              paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+            chart_ph.plotly_chart(fig, use_container_width=True)
+            
+            # Details Table (Explainability)
+            details_df = pd.DataFrame([
+                {"Feature": "Protocol", "Value": feat['protocol_type']},
+                {"Feature": "Traffic Count (2s)", "Value": feat['count']},
+                {"Feature": "Service", "Value": feat['service']},
+                {"Feature": "Src Bytes", "Value": feat['src_bytes']}
+            ])
+            details_ph.dataframe(details_df, use_container_width=True, hide_index=True)
+            
+            # Log Table
+            log_display = df_hist[['Time', 'Risk', 'Bytes']].copy()
+            log_display['Status'] = df_hist['IsAttack'].apply(lambda x: "🚨 ATTACK" if x else "OK")
+            # Show last 5 entries
+            log_ph.dataframe(log_display.sort_index(ascending=False).head(5), use_container_width=True)
+            
+            time.sleep(0.05)
+    else:
+        st.info("System Standby. Click 'Start Monitoring' in the sidebar.")
 
 if __name__ == "__main__":
     main()
