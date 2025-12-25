@@ -2,337 +2,316 @@ import streamlit as st
 import pandas as pd
 import joblib
 import json
-import plotly.graph_objects as go
 import plotly.express as px
 from pathlib import Path
 import numpy as np
 import time
+import datetime
 from collections import deque
 from scapy.all import sniff, IP, TCP, UDP, ICMP
-import datetime
-import requests  # Added for Telegram integration
+import requests
+import os
 
 # ==========================================
-# 1. PAGE CONFIGURATION & STYLING
+# 1. PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="Sentinel AI | Advanced IDS",
+    page_title="SentinelAI | Advanced IDS",
     page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS for Dark Theme
-st.markdown("""
-<style>
-    .stApp { background-color: #0E1117; color: #FAFAFA; }
-    .stMetric { background-color: #262730; padding: 10px; border-radius: 5px; border-left: 5px solid #4CAF50; }
-    /* Headers */
-    h1, h2, h3 { font-family: 'Segoe UI', sans-serif; font-weight: 600; }
-    /* Dataframes */
-    div[data-testid="stDataFrame"] { border: 1px solid #333; border-radius: 5px; }
-</style>
-""", unsafe_allow_html=True)
-
 # ==========================================
-# 2. TELEGRAM CONFIGURATION
+# 2. TELEGRAM CONFIG (ENV VARS)
 # ==========================================
-# Credentials from your previous code
-TELEGRAM_TOKEN = "8225807627:AAE6HavZtBvq0JJ1QJBYeiMUYOXCUTKUbac"
-TELEGRAM_CHAT_ID = "1340013944"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def send_telegram_alert(risk_score, protocol, src_ip):
-    """
-    Sends an alert to Telegram when an attack is detected.
-    """
-    msg = (f"🚨 *SECURITY ALERT!* \n\n"
-           f"⚠️ **Threat Detected!**\n"
-           f"📊 **Attack Probability:** {risk_score:.1%}\n"
-           f"🔌 **Protocol:** {protocol}\n"
-           f"📍 **Source IP:** {src_ip}\n"
-           f"🛡️ **Action:** Logging event & Monitoring.")
-    
+def send_telegram_alert(risk, proto, src_ip):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    msg = (
+        f"🚨 *SECURITY ALERT*\n\n"
+        f"Risk: {risk:.1%}\n"
+        f"Protocol: {proto}\n"
+        f"Source IP: {src_ip}"
+    )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        # Send the request to Telegram API
-        requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+        requests.get(url, params={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "Markdown"
+        }, timeout=3)
+    except Exception:
+        pass
 
 # ==========================================
-# 3. HELPER FUNCTIONS
+# SAFE TRANSFORMER (REQUIRED FOR MODEL LOAD)
 # ==========================================
-# This function must be defined before loading the model
 def safe_log1p(x):
+    # Must exist for unpickling the trained model
     return np.log1p(np.abs(x))
 
 # ==========================================
-# 4. LOAD SYSTEM RESOURCES
+# 3. LOAD SYSTEM FILES
 # ==========================================
-def get_project_root():
-    """
-    Finds the project root directory to locate models and data.
-    """
-    current_path = Path(__file__).resolve().parent
-    for _ in range(4):
-        if (current_path / "results").exists(): return current_path
-        current_path = current_path.parent
-        if current_path == current_path.parent: break
-    return current_path # Fallback
+def get_root():
+    p = Path(__file__).resolve().parent
+    for _ in range(6):
+        if (p / "results").exists():
+            return p
+        p = p.parent
+    return Path(__file__).resolve().parent
 
-try:
-    ROOT = get_project_root()
-    FILES = {
-        "binary": ROOT / "results/models/binary_model.pkl",
-        "multi": ROOT / "results/models/multi_model.pkl",
-        "enc": ROOT / "results/models/multi_label_encoder.pkl",
-        "meta": ROOT / "results/models/model_metadata.json",
-        "schema": ROOT / "data/processed/realtime_schema.json"
-    }
-except:
-    st.error("Error: Could not locate project files. Please check directory structure.")
-    st.stop()
+ROOT = get_root()
+
+FILES = {
+    "binary": ROOT / "results/models/binary_model.pkl",
+    "schema": ROOT / "data/processed/realtime_schema.json"
+}
 
 @st.cache_resource
 def load_system():
-    """
-    Loads trained models and schema metadata.
-    """
     sys = {}
-    try:
-        # Ensure the function is available in global memory for joblib
-        global safe_log1p
-        
-        sys["bin"] = joblib.load(FILES["binary"])
-        sys["mul"] = joblib.load(FILES["multi"])
-        sys["enc"] = joblib.load(FILES["enc"])
-        with open(FILES["schema"]) as f: sys["schema"] = json.load(f)
-    except Exception as e:
-        st.error(f"Failed to load models: {e}")
-        st.error("Tip: This usually happens if 'safe_log1p' is missing.")
+    sys["model"] = joblib.load(FILES["binary"])
+    with open(FILES["schema"], "r", encoding="utf-8") as f:
+        sys["schema"] = json.load(f)
     return sys
 
 system = load_system()
-
-# Initialize Session State
-if 'history' not in st.session_state:
-    st.session_state.history = deque(maxlen=60) # Keep last 60 packets
-if 'packet_times' not in st.session_state:
-    st.session_state.packet_times = deque(maxlen=2000) # Used for traffic intensity
-# State to manage Telegram spam (Rate Limiting)
-if 'last_telegram_alert' not in st.session_state:
-    st.session_state.last_telegram_alert = 0
+RAW_COLUMNS = system["schema"]["raw_feature_columns"]
 
 # ==========================================
-# 5. PACKET PROCESSING ENGINE
+# 4. FLOW HELPERS
 # ==========================================
+def infer_service(dport, proto):
+    if proto == "tcp":
+        return {
+            80: "http", 443: "https", 22: "ssh",
+            21: "ftp", 25: "smtp", 110: "pop_3"
+        }.get(int(dport), "private")
+    if proto == "udp" and int(dport) == 53:
+        return "domain_u"
+    return "private"
+
+def new_flow(t0, proto, service):
+    return {
+        "start": t0,
+        "last": t0,
+        "proto": proto,
+        "service": service,
+        "src_bytes": 0,
+        "dst_bytes": 0,
+        "syn": 0,
+        "ack": 0,
+        "rst": 0,
+        "pkt_count": 0
+    }
+
+
+# ==========================================
+# 5. PACKET ENGINE
+# ==========================================
+FLOW_TIMEOUT = 10.0
+flows = {}
+recent_conns = deque(maxlen=200)
+
 def process_packet(pkt):
-    """
-    Extracts features from raw Scapy packets to match model input.
-    """
-    try:
-        if IP not in pkt: return None
-        
-        feat = {}
-        # Basic Protocol Extraction
-        if TCP in pkt:
-            feat['protocol_type'] = 'tcp'
-            feat['service'] = 'http' if pkt[TCP].dport in [80, 443, 8080] else 'private'
-            feat['flag'] = 'SF'
-        elif UDP in pkt:
-            feat['protocol_type'] = 'udp'
-            feat['service'] = 'domain_u' # Common for DNS/Streaming
-            feat['flag'] = 'SF'
-        elif ICMP in pkt:
-            feat['protocol_type'] = 'icmp'
-            feat['service'] = 'ecr_i'
-            feat['flag'] = 'SF'
-        else:
-            return None
-
-        feat['src_bytes'] = len(pkt)
-        feat['dst_bytes'] = 0
-        
-        # Calculate Traffic Intensity ('count' feature)
-        now = time.time()
-        st.session_state.packet_times.append(now)
-        # How many packets arrived in the last 2 seconds?
-        recent_count = len([t for t in st.session_state.packet_times if now - t <= 2.0])
-        feat['count'] = recent_count
-        
-        # Default values for complex features not calculable in simple sniffing
-        feat['srv_count'] = recent_count 
-        feat['same_srv_rate'] = 1.0
-        feat['diff_srv_rate'] = 0.0
-        feat['dst_host_count'] = 1
-        feat['dst_host_srv_count'] = 1
-        
-        return feat, pkt[IP].src, pkt[IP].dst
-    except:
+    if IP not in pkt:
         return None
 
+    now = time.time()
+    src_ip = pkt[IP].src
+    dst_ip = pkt[IP].dst
+
+    proto, sport, dport = None, 0, 0
+    if TCP in pkt:
+        proto = "tcp"
+        sport = int(pkt[TCP].sport)
+        dport = int(pkt[TCP].dport)
+    elif UDP in pkt:
+        proto = "udp"
+        sport = int(pkt[UDP].sport)
+        dport = int(pkt[UDP].dport)
+    elif ICMP in pkt:
+        proto = "icmp"
+    else:
+        return None
+
+    service = infer_service(dport, proto)
+    key = (src_ip, dst_ip, sport, dport, proto)
+
+    if key not in flows:
+        flows[key] = new_flow(now, proto, service)
+        recent_conns.append({"dst": dst_ip, "service": service})
+
+    stf = flows[key]
+    stf["last"] = now
+    stf["src_bytes"] += len(pkt)
+    stf["pkt_count"] += 1
+
+
+    if proto == "tcp":
+        flags = str(pkt[TCP].flags)
+        stf["syn"] += int("S" in flags)
+        stf["ack"] += int("A" in flags)
+        stf["rst"] += int("R" in flags)
+
+
+    duration = stf["last"] - stf["start"]
+
+    dst_window = [c for c in recent_conns if c["dst"] == dst_ip]
+    dst_count = len(dst_window)
+    dst_srv_count = sum(1 for c in dst_window if c["service"] == service)
+    same_srv_rate = dst_srv_count / dst_count if dst_count else 0.0
+    dst_host_same_srv_rate = same_srv_rate
+    dst_host_diff_srv_rate = 1.0 - same_srv_rate
+
+    serror_rate = stf["syn"] / stf["pkt_count"] if stf["pkt_count"] else 0.0
+    srv_serror_rate = serror_rate
+    rerror_rate = stf["rst"] / stf["pkt_count"] if stf["pkt_count"] else 0.0
+
+    src_bytes_rate = stf["src_bytes"] / duration if duration > 0 else 0.0
+    connections_per_sec = dst_count / duration if duration > 0 else 0.0
+
+    flag = "SF" if stf["ack"] > 0 else "S0"
+
+    features = {
+        "duration": float(duration),
+        "protocol_type": proto,
+        "service": service,
+        "flag": flag,
+        "src_bytes": float(stf["src_bytes"]),
+        "dst_bytes": float(stf["dst_bytes"]),
+
+        "count": float(dst_count),
+        "srv_count": float(dst_srv_count),
+        "same_srv_rate": float(same_srv_rate),
+
+        "dst_host_count": float(dst_count),
+        "dst_host_srv_count": float(dst_srv_count),
+        "dst_host_same_srv_rate": float(dst_host_same_srv_rate),
+        "dst_host_diff_srv_rate": float(dst_host_diff_srv_rate),
+
+        "serror_rate": float(serror_rate),
+        "srv_serror_rate": float(srv_serror_rate),
+        "rerror_rate": float(rerror_rate),
+
+        "src_bytes_rate": float(src_bytes_rate),
+        "connections_per_sec": float(connections_per_sec),
+    }
+
+
+    expired = [k for k, v in flows.items() if now - v["last"] > FLOW_TIMEOUT]
+    for k in expired:
+        flows.pop(k, None)
+
+    return features, src_ip
+
 # ==========================================
-# 6. MAIN DASHBOARD UI
+# 6. STREAMLIT UI
 # ==========================================
 def main():
-    # --- Sidebar Controls ---
-    with st.sidebar:
-        st.header("🎛️ Control Panel")
-        run_sniffer = st.toggle("Start Monitoring (Live Sniffer)", value=False)
-        
-        st.divider()
-        st.subheader("Model Calibration")
-        
-        # Sensitivity Slider
-        threshold = st.slider("Alert Threshold", 0.0, 1.0, 0.75, 
-                              help="Higher value = Fewer alerts. Lower value = More sensitive.")
-        
-        # Logic Inversion
-        invert_logic = st.checkbox("Invert Model Logic", value=False, 
-                                   help="Check this if the system flags safe traffic as attacks.")
-        
-        # Noise Filter
-        smart_filter = st.checkbox("Smart Filter (Reduce Noise)", value=True, 
-                                   help="Ignores standard UDP/DNS traffic unless risk is very high.")
-        
-        # Telegram Toggle
-        enable_telegram = st.checkbox("Enable Telegram Alerts", value=True,
-                                      help="Send notifications to Admin when attack is detected.")
-        
-        st.info("Tip: If you see too many False Positives, check 'Invert Model Logic' first.")
+    # Persistent history & Telegram rate-limit state
+    if "history" not in st.session_state:
+        st.session_state.history = deque(maxlen=200)
+    if "last_alert_ts" not in st.session_state:
+        st.session_state.last_alert_ts = 0.0
 
-    st.title("🛡️ Network Traffic Inspector")
-    
-    # --- Layout Metrics ---
-    # Top Metrics Row
-    c1, c2, c3, c4 = st.columns(4)
-    kpi_status = c1.empty()
-    kpi_risk = c2.empty()
-    kpi_proto = c3.empty()
-    kpi_vol = c4.empty()
-    
-    st.divider()
-    
-    # Main Analysis Area
-    col_main, col_details = st.columns([2, 1])
-    
-    with col_main:
-        st.subheader("📊 Real-Time Risk Analysis")
-        chart_ph = st.empty()
-        
-    with col_details:
-        st.subheader("🔍 Last Packet Details")
-        details_ph = st.empty()
+    st.sidebar.title("🎛️ Control Panel")
+    run = st.sidebar.toggle("Start Monitoring", value=False)
+    threshold = st.sidebar.slider("Alert Threshold", 0.50, 0.99, 0.90, 0.01)
+    telegram = st.sidebar.checkbox("Telegram Alerts", True)
+    udp_filter = st.sidebar.checkbox("Smart UDP Filter", True)
+    warmup_packets = st.sidebar.number_input("Warm-up packets", min_value=0, max_value=200, value=15, step=1)
 
-    # Log Table
-    st.subheader("📜 Traffic Log")
+    st.title("🛡️ SentinelAI – Real-Time IDS")
+
+    k1, k2, k3 = st.columns(3)
+    kpi_status = k1.empty()
+    kpi_risk = k2.empty()
+    kpi_proto = k3.empty()
+
+    chart_ph = st.empty()
     log_ph = st.empty()
 
-    # --- Sniffer Loop ---
-    if run_sniffer:
+    if run:
         while True:
-            # 1. Capture Packet
-            packets = sniff(count=1, timeout=0.1)
+            packets = sniff(count=1, timeout=0.2)
             if not packets:
                 time.sleep(0.01)
                 continue
-            
-            # 2. Process Packet
-            data = process_packet(packets[0])
-            if not data: continue
-            feat, src_ip, dst_ip = data
-            
-            # 3. Prepare Data for Model
-            # Create a DataFrame with all columns initialized to 0.0
-            input_df = pd.DataFrame(0.0, index=[0], columns=system["schema"]["raw_feature_columns"])
-            # Update only extracted features
+
+            res = process_packet(packets[0])
+            if not res:
+                continue
+
+            feat, src_ip = res
+
+            # Build row with all expected columns
+            row = pd.DataFrame(0.0, index=[0], columns=RAW_COLUMNS)
+
             for k, v in feat.items():
-                if k in input_df.columns:
-                    input_df[k] = v
-            
-            # 4. Prediction
+                if k in row.columns:
+                    row[k] = v
+
+            # Predict
             try:
-                raw_prob = system["bin"].predict_proba(input_df)[0]
-                
-                # Handle Inverted Logic
-                # Usually index [1] is 'Attack'. If model is inverted, index [0] is 'Attack'.
-                if invert_logic:
-                    prob_attack = raw_prob[0] 
-                else:
-                    prob_attack = raw_prob[1]
-            except Exception as e:
-                # Fallback if prediction fails
-                prob_attack = 0.0
-                
-            # 5. Smart Filtering Logic
-            is_alert = False
-            
-            if smart_filter:
-                # If protocol is UDP (often noise) and probability isn't extreme -> Ignore
-                if feat['protocol_type'] == 'udp' and prob_attack < 0.95:
-                    is_alert = False
-                    prob_attack = 0.1 # Artificially lower visual risk
-                elif prob_attack > threshold:
-                    is_alert = True
-            else:
-                if prob_attack > threshold:
-                    is_alert = True
+                prob = float(system["model"].predict_proba(row)[0][1])
+            except Exception:
+                prob = 0.0
+            non_zero_features = int((row.values != 0).sum())
+            st.metric("Active Features", f"{non_zero_features}/{len(row.columns)}")
 
-            # 6. Telegram Notification Logic (New Feature)
-            if is_alert and enable_telegram:
-                current_time = time.time()
-                # Check if 10 seconds have passed since last alert to avoid spam
-                if current_time - st.session_state.last_telegram_alert > 10:
-                    send_telegram_alert(prob_attack, feat['protocol_type'], src_ip)
-                    st.session_state.last_telegram_alert = current_time
+            # Warm-up guard (before deciding attack)
+            if len(recent_conns) < int(warmup_packets):
+                prob = 0.0
 
-            # 7. Update History State
-            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            # Smart filter for UDP noise
+            if udp_filter and feat["protocol_type"] == "udp" and prob < 0.95:
+                prob = 0.1
+
+            is_attack = prob > threshold
+
+            # Telegram rate-limit: one alert per 10 seconds
+            if is_attack and telegram:
+                now_ts = time.time()
+                if now_ts - st.session_state.last_alert_ts > 10:
+                    send_telegram_alert(prob, feat["protocol_type"], src_ip)
+                    st.session_state.last_alert_ts = now_ts
+
+            # Append to history
             st.session_state.history.append({
-                "Time": now_str, 
-                "Risk": prob_attack, 
-                "Bytes": feat['src_bytes'],
-                "IsAttack": 1 if is_alert else 0
+                "Time": datetime.datetime.now().strftime("%H:%M:%S"),
+                "Risk": prob,
+                "Protocol": feat["protocol_type"],
+                "Bytes": feat["src_bytes"],
+                "Status": "ATTACK" if is_attack else "OK",
+                "SrcIP": src_ip
             })
-            
-            # --- Render UI Updates ---
-            
+
             # KPIs
-            if is_alert:
-                kpi_status.metric("Status", "⚠️ ATTACK DETECTED", delta_color="inverse")
+            kpi_status.metric("Status", "🚨 ATTACK" if is_attack else "✅ OK")
+            kpi_risk.metric("Attack Probability", f"{prob:.1%}")
+            kpi_proto.metric("Protocol", feat["protocol_type"].upper())
+
+            # Chart (guard empty)
+            df = pd.DataFrame(st.session_state.history)
+            if not df.empty:
+                fig = px.area(df, x="Time", y="Risk")
+                fig.update_layout(yaxis_range=[0, 1])
+                chart_ph.plotly_chart(fig, use_container_width=True)
             else:
-                kpi_status.metric("Status", "✅ SYSTEM SECURE", delta_color="normal")
-            
-            kpi_risk.metric("Attack Probability", f"{prob_attack:.1%}", delta=None)
-            kpi_proto.metric("Protocol", feat['protocol_type'].upper())
-            kpi_vol.metric("Packet Size", f"{feat['src_bytes']} bytes")
-            
-            # Chart
-            df_hist = pd.DataFrame(st.session_state.history)
-            fig = px.area(df_hist, x="Time", y="Risk", title="Risk Level Over Time", 
-                          color_discrete_sequence=["#FF4B4B" if is_alert else "#00CC96"])
-            fig.update_layout(yaxis_range=[0, 1.1], height=300, 
-                              paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-            chart_ph.plotly_chart(fig, use_container_width=True)
-            
-            # Details Table (Explainability)
-            details_df = pd.DataFrame([
-                {"Feature": "Protocol", "Value": feat['protocol_type']},
-                {"Feature": "Traffic Count (2s)", "Value": feat['count']},
-                {"Feature": "Service", "Value": feat['service']},
-                {"Feature": "Src Bytes", "Value": feat['src_bytes']}
-            ])
-            details_ph.dataframe(details_df, use_container_width=True, hide_index=True)
-            
-            # Log Table
-            log_display = df_hist[['Time', 'Risk', 'Bytes']].copy()
-            log_display['Status'] = df_hist['IsAttack'].apply(lambda x: "🚨 ATTACK" if x else "OK")
-            # Show last 5 entries
-            log_ph.dataframe(log_display.sort_index(ascending=False).head(5), use_container_width=True)
-            
+                chart_ph.info("Waiting for traffic data...")
+
+            # Log table
+            log_df = df[["Time", "Risk", "Protocol", "Bytes", "Status", "SrcIP"]].copy()
+            log_ph.dataframe(log_df.sort_index(ascending=False).head(15), use_container_width=True)
+
             time.sleep(0.05)
     else:
-        st.info("System Standby. Click 'Start Monitoring' in the sidebar.")
+        st.info("System standby. Turn on 'Start Monitoring' in the sidebar.")
 
 if __name__ == "__main__":
     main()
