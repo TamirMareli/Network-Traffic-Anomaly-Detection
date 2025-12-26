@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZEEK_LOG_DIR="/mnt/c/Users/elair/zeek_logs"
@@ -10,11 +10,6 @@ DASH_APP="src/dashboard/app.py"
 
 PID_DIR="$PROJECT_ROOT/results/realtime"
 LOG_DIR="$PROJECT_ROOT/results/logs"
-
-ZEEK_PID="$PID_DIR/zeek.pid"
-RUNNER_PID="$PID_DIR/runner.pid"
-DASH_PID="$PID_DIR/dashboard.pid"
-
 mkdir -p "$PID_DIR" "$LOG_DIR" "$ZEEK_LOG_DIR"
 
 echo "== NIDS START =="
@@ -24,68 +19,36 @@ echo "Iface:     $IFACE"
 echo "Dashboard: http://localhost:8501"
 echo ""
 
-is_running() { kill -0 "$1" 2>/dev/null; }
+# 1) Ask sudo password ONCE (interactive, pretty)
+echo "[*] Sudo auth (one-time)..."
+sudo -v
 
-start_bg() {
-  local name="$1"
-  local pidfile="$2"
-  local outlog="$3"
-  local errlog="$4"
-  shift 4
+# 2) Start dashboard in background
+echo "[*] Starting Dashboard..."
+(
+  cd "$PROJECT_ROOT"
+  streamlit run "$DASH_APP" --server.headless true --server.port 8501
+) > "$LOG_DIR/dashboard.out.log" 2> "$LOG_DIR/dashboard.err.log" &
+echo $! > "$PID_DIR/dashboard.pid"
+echo "    [OK] Dashboard pid=$(cat "$PID_DIR/dashboard.pid")"
 
-  echo "[*] Starting $name..."
-  ("$@") >"$outlog" 2>"$errlog" &
-  local pid=$!
-  echo "$pid" > "$pidfile"
-  sleep 0.3
-
-  if is_running "$pid"; then
-    echo "    [OK] $name (pid=$pid)"
-  else
-    echo "    [FAIL] $name did not stay running."
-    echo "    See logs:"
-    echo "      $outlog"
-    echo "      $errlog"
-    exit 1
-  fi
-}
-
-# preflight
-if [[ ! -x "$ZEEK_BIN" ]]; then
-  echo "[FAIL] Zeek binary not found at: $ZEEK_BIN"
-  exit 1
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "[FAIL] python3 not found"
-  exit 1
-fi
-
-if ! command -v streamlit >/dev/null 2>&1; then
-  echo "[FAIL] streamlit not found. Install: python3 -m pip install streamlit"
-  exit 1
-fi
-
-# ensure sudo won't prompt in background
-if ! sudo -n true 2>/dev/null; then
-  echo "[!] Sudo needs password first. Run:"
-  echo "    sudo -v"
-  echo "Then re-run:"
-  echo "    ./scripts/start_all.sh"
-  exit 1
-fi
-
-start_bg "Zeek" "$ZEEK_PID" "$LOG_DIR/zeek.out.log" "$LOG_DIR/zeek.err.log" \
-  bash -lc "cd '$ZEEK_LOG_DIR' && sudo '$ZEEK_BIN' -C -i '$IFACE'"
-
-start_bg "Model runner" "$RUNNER_PID" "$LOG_DIR/runner.out.log" "$LOG_DIR/runner.err.log" \
-  bash -lc "cd '$PROJECT_ROOT' && python3 '$MODEL_RUNNER'"
-
-start_bg "Dashboard" "$DASH_PID" "$LOG_DIR/dashboard.out.log" "$LOG_DIR/dashboard.err.log" \
-  bash -lc "cd '$PROJECT_ROOT' && streamlit run '$DASH_APP' --server.headless true --server.port 8501"
+# 3) Start model runner in background
+echo "[*] Starting Model runner..."
+(
+  cd "$PROJECT_ROOT"
+  python3 "$MODEL_RUNNER"
+) > "$LOG_DIR/runner.out.log" 2> "$LOG_DIR/runner.err.log" &
+echo $! > "$PID_DIR/runner.pid"
+echo "    [OK] Runner pid=$(cat "$PID_DIR/runner.pid")"
 
 echo ""
-echo "✅ All started."
+echo "✅ Dashboard + Model runner started."
 echo "Open: http://localhost:8501"
-echo "PIDs: $PID_DIR"
+echo ""
+echo "Now running Zeek in this terminal (CTRL+C stops Zeek)."
 echo "Logs: $LOG_DIR"
+echo ""
+
+# 4) Run Zeek in FOREGROUND (needs sudo)
+cd "$ZEEK_LOG_DIR"
+sudo "$ZEEK_BIN" -C -i "$IFACE"
